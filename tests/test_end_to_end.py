@@ -12,9 +12,11 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 import urllib.request
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PY = sys.executable
@@ -118,16 +120,38 @@ class EndToEnd(unittest.TestCase):
 
 
 class Voice(unittest.TestCase):
-    def test_voice_command(self):
+    def test_voice_forwarded_to_webhook(self):
+        self.check_forwarded([])
+
+    def test_xiaozhi_voice_forwarded_to_webhook(self):
+        received = self.check_forwarded(["--xiaozhi"])
+        # Neither the wake-word echo (">> Alexa.") nor the reply ("<<") is forwarded.
+        self.assertTrue(all(r["text"] == "Move the arm to the left." for r in received))
+
+    def check_forwarded(self, fake_args: list) -> list:
+        received = []
+
+        class Arm(BaseHTTPRequestHandler):
+            def do_POST(self):
+                received.append(json.loads(self.rfile.read(int(self.headers["Content-Length"]))))
+                self.send_response(200)
+                self.end_headers()
+
+            def log_message(self, *args):
+                pass
+
+        arm = HTTPServer(("127.0.0.1", 0), Arm)
+        threading.Thread(target=arm.serve_forever, daemon=True).start()
         tmp = tempfile.mkdtemp()
         fake = subprocess.Popen(
             [PY, "-u", os.path.join(ROOT, "tools", "fake_watcher.py"),
-             "--say", "Move the arm to the left.", "--every", "0.5"],
+             "--say", "Move the arm to the left.", "--every", "0.5", *fake_args],
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         serial_port = fake.stdout.readline().strip().split()[-1]
         receiver = subprocess.Popen(
             [PY, os.path.join(ROOT, "watcher", "receiver.py"), "--host", "127.0.0.1",
-             "--port", str(free_port()), "--voice", serial_port],
+             "--port", str(free_port()), "--voice", serial_port,
+             "--forward", f"http://127.0.0.1:{arm.server_port}/voice"],
             cwd=tmp, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         try:
             log = os.path.join(tmp, "data", "events.jsonl")
@@ -140,9 +164,17 @@ class Voice(unittest.TestCase):
             with open(log) as f:
                 evt = json.loads(f.readline())
             self.assertEqual(evt["source"], "voice")
-            self.assertEqual(evt["command"], "arm_left")
             self.assertEqual(evt["text"], "Move the arm to the left.")
+            for _ in range(30):
+                if len(received) >= 2:  # the fake repeats every 0.5 s
+                    break
+                time.sleep(0.1)
+            self.assertEqual(received[0]["source"], "voice")
+            self.assertEqual(received[0]["text"], "Move the arm to the left.")
+            return received
         finally:
+            arm.shutdown()
+            arm.server_close()
             for p in (receiver, fake):
                 p.terminate()
                 p.wait(timeout=5)
