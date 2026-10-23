@@ -1,0 +1,7 @@
+__pycache__/
+poses.json
+.venv
+limits.json
+remedio
+flags/
+settings.json
